@@ -4,6 +4,8 @@
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::cmp::max;
+use std::net::IpAddr;
+use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1079,6 +1081,7 @@ impl Servo {
                 opts.certificate_path.clone(),
                 opts.ignore_certificate_errors,
                 protocols.clone(),
+                builder.name_resolver,
             );
 
         let (private_storage_threads, public_storage_threads) = new_storage_threads(
@@ -1541,6 +1544,9 @@ pub struct ServoBuilder {
     preferences: Option<Box<Preferences>>,
     event_loop_waker: Box<dyn EventLoopWaker>,
     protocol_registry: ProtocolRegistry,
+    name_resolver: Option<
+        Box<fn(&str) -> Pin<Box<dyn Future<Output = Result<IpAddr, std::io::Error>> + Send>>>,
+    >,
 }
 
 impl Default for ServoBuilder {
@@ -1550,6 +1556,7 @@ impl Default for ServoBuilder {
             preferences: Default::default(),
             event_loop_waker: Box::new(DefaultEventLoopWaker),
             protocol_registry: Default::default(),
+            name_resolver: None,
         }
     }
 }
@@ -1576,6 +1583,16 @@ impl ServoBuilder {
 
     pub fn protocol_registry(mut self, protocol_registry: ProtocolRegistry) -> Self {
         self.protocol_registry = protocol_registry;
+        self
+    }
+
+    pub fn name_resolver(
+        mut self,
+        name_resolver: Box<
+            fn(&str) -> Pin<Box<dyn Future<Output = Result<IpAddr, std::io::Error>> + Send>>,
+        >,
+    ) -> Self {
+        self.name_resolver = Some(name_resolver);
         self
     }
 }

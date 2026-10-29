@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, mem, str};
@@ -110,6 +111,14 @@ pub struct FetchContext {
     pub ignore_certificate_errors: bool,
     pub preloaded_resources: SharedPreloadedResources,
     pub in_flight_keep_alive_records: SharedInflightKeepAliveRecords,
+    pub name_resolver: Option<
+        Box<
+            fn(
+                &str,
+            )
+                -> std::pin::Pin<Box<dyn Future<Output = Result<IpAddr, std::io::Error>> + Send>>,
+        >,
+    >,
 }
 
 #[derive(Default)]

@@ -6,6 +6,8 @@ use std::cell::RefCell;
 use std::collections::hash_map::HashMap;
 use std::convert::TryFrom;
 use std::error::Error;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use std::{fmt, io};
@@ -18,9 +20,8 @@ use hyper::body::Bytes;
 use hyper::rt::Executor;
 use hyper_rustls::{HttpsConnector as HyperRustlsHttpsConnector, MaybeHttpsStream};
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::proxy::Tunnel;
 use hyper_util::client::legacy::connect::{
-    Connected, Connection, HttpConnector as HyperHttpConnector,
+    Connected, Connection, dns::Name, HttpConnector as HyperHttpConnector, proxy::Tunnel,
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use log::warn;
@@ -44,12 +45,24 @@ pub const ALPN_H2: &str = "h2";
 
 #[derive(Clone)]
 pub struct ServoHttpConnector {
-    inner: HyperHttpConnector,
+    inner: HyperHttpConnector<HookResolver>,
 }
 
 impl ServoHttpConnector {
-    fn new() -> ServoHttpConnector {
-        let mut inner = HyperHttpConnector::new();
+    fn new(
+        name_resolver: Option<
+            Box<
+                fn(
+                    &str,
+                ) -> std::pin::Pin<
+                    Box<dyn Future<Output = Result<IpAddr, std::io::Error>> + Send>,
+                >,
+            >,
+        >,
+    ) -> ServoHttpConnector {
+        let mut inner = HyperHttpConnector::<HookResolver>::new_with_resolver(HookResolver {
+            name_resolver,
+        });
         inner.enforce_http(false);
         inner.set_happy_eyeballs_timeout(None);
         inner.set_connect_timeout(Some(Duration::from_secs(pref!(network_connection_timeout))));
@@ -581,6 +594,7 @@ pub enum ConnectionError {
     HttpError(BoxError),
     // It looks like currently the type is not exported.
     ProxyError(BoxError),
+    NameResolutionError(BoxError),
 }
 
 impl std::fmt::Display for ConnectionError {
@@ -594,6 +608,7 @@ impl std::error::Error for ConnectionError {
         match self {
             ConnectionError::HttpError(error) => error.source(),
             ConnectionError::ProxyError(error) => error.source(),
+            ConnectionError::NameResolutionError(error) => error.source(),
         }
     }
 }
@@ -609,13 +624,23 @@ pub struct ProxyConnector {
 }
 
 impl ProxyConnector {
-    fn new() -> Self {
+    fn new(
+        name_resolver: Option<
+            Box<
+                fn(
+                    &str,
+                ) -> std::pin::Pin<
+                    Box<dyn Future<Output = Result<IpAddr, std::io::Error>> + Send>,
+                >,
+            >,
+        >,
+    ) -> Self {
         let matcher_builder = hyper_util::client::proxy::matcher::Matcher::builder()
             .http(servo_config::pref!(network_http_proxy_uri))
             .https(servo_config::pref!(network_https_proxy_uri))
             .no(servo_config::pref!(network_http_no_proxy));
         ProxyConnector {
-            client: ServoHttpConnector::new(),
+            client: ServoHttpConnector::new(name_resolver),
             matcher: std::sync::Arc::new(matcher_builder.build()),
         }
     }
@@ -658,13 +683,23 @@ impl Service<Destination> for ProxyConnector {
 
 pub type ServoClient = Client<InstrumentedConnector<ProxyConnector>, BoxedBody>;
 
-pub fn create_http_client(tls_config: TlsConfig) -> ServoClient {
+pub fn create_http_client(
+    tls_config: TlsConfig,
+    name_resolver: Option<
+        Box<
+            fn(
+                &str,
+            )
+                -> std::pin::Pin<Box<dyn Future<Output = Result<IpAddr, std::io::Error>> + Send>>,
+        >,
+    >,
+) -> ServoClient {
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls_config)
         .https_or_http()
         .enable_http1()
         .enable_http2()
-        .wrap_connector(ProxyConnector::new());
+        .wrap_connector(ProxyConnector::new(name_resolver));
 
     Client::builder(TokioExecutor {})
         .http1_title_case_headers(true)
@@ -678,4 +713,91 @@ pub fn create_http_client(tls_config: TlsConfig) -> ServoClient {
         // without bound.
         .pool_max_idle_per_host(6)
         .build(InstrumentedConnector::from(connector))
+}
+
+#[derive(Clone)]
+struct HookResolver {
+    name_resolver: Option<
+        Box<
+            fn(
+                &str,
+            )
+                -> std::pin::Pin<Box<dyn Future<Output = Result<IpAddr, std::io::Error>> + Send>>,
+        >,
+    >,
+}
+
+struct HookResolverFuture {
+    inner: tokio::task::JoinHandle<Result<ResolvedAddrs, std::io::Error>>,
+}
+
+impl Future for HookResolverFuture {
+    type Output = Result<ResolvedAddrs, io::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.inner).poll(cx).map(|res| match res {
+            Ok(Ok(addrs)) => Ok(addrs),
+            Ok(Err(err)) => Err(err),
+            Err(join_err) => {
+                panic!("background task failed: {join_err:?}")
+            },
+        })
+    }
+}
+
+impl Drop for HookResolverFuture {
+    fn drop(&mut self) {
+        self.inner.abort();
+    }
+}
+
+struct ResolvedAddrs {
+    iter: std::vec::IntoIter<SocketAddr>,
+}
+
+impl ResolvedAddrs {
+    fn new(addrs: Vec<SocketAddr>) -> Self {
+        ResolvedAddrs {
+            iter: addrs.into_iter(),
+        }
+    }
+}
+
+impl Iterator for ResolvedAddrs {
+    type Item = SocketAddr;
+    #[inline]
+    fn next(&mut self) -> Option<SocketAddr> {
+        self.iter.next()
+    }
+}
+
+impl Service<Name> for HookResolver {
+    type Response = ResolvedAddrs;
+    type Error = std::io::Error;
+    type Future = HookResolverFuture;
+
+    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        if let Some(name_resolver) = self.name_resolver.clone() {
+            HookResolverFuture {
+                inner: tokio::task::spawn(async move {
+                    Ok(ResolvedAddrs::new(vec![SocketAddr::new(
+                        name_resolver(name.as_str()).await?,
+                        0,
+                    )]))
+                }),
+            }
+        } else {
+            HookResolverFuture {
+                inner: tokio::task::spawn(async move {
+                    Ok(ResolvedAddrs {
+                        iter: std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), 0))?,
+                    })
+                }),
+            }
+        }
+    }
 }

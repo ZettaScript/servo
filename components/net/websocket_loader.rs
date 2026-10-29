@@ -11,6 +11,7 @@
 //! over events from the network and events from the DOM, using async/await to avoid
 //! the need for a dedicated thread per websocket.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -309,6 +310,14 @@ pub(crate) async fn start_websocket(
     client: &net_traits::request::Request,
     tls_config: TlsConfig,
     dom_action_receiver: CallbackSetter<WebSocketDomAction>,
+    name_resolver: Option<
+        Box<
+            fn(
+                &str,
+            )
+                -> std::pin::Pin<Box<dyn Future<Output = Result<IpAddr, std::io::Error>> + Send>>,
+        >,
+    >,
 ) -> Result<Response, Error> {
     trace!("starting WS connection to {}", client.url());
 
@@ -329,7 +338,12 @@ pub(crate) async fn start_websocket(
         .port_or_known_default()
         .ok_or_else(|| Error::Url(UrlError::UnableToConnect("Unknown port".into())))?;
 
-    let try_socket = TcpStream::connect((&*domain.to_string(), port)).await;
+    let try_socket =
+        if let (Some(name_resolver), url::Host::Domain(domain)) = (name_resolver, &domain) {
+            TcpStream::connect((name_resolver(domain).await.map_err(|e| Error::Io(e))?, port)).await
+        } else {
+            TcpStream::connect((&*domain.to_string(), port)).await
+        };
     let socket = try_socket.map_err(Error::Io)?;
     let connector = TlsConnector::from(Arc::new(tls_config));
 

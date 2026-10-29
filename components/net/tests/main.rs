@@ -121,7 +121,7 @@ fn create_http_state(fc: Option<GenericEmbedderProxy<NetToEmbedderMsg>>) -> Http
             net::connector::CACertificates::Default,
             false, /* ignore_certificate_errors */
             override_manager.clone(),
-        )),
+        ), None),
         override_manager,
         embedder_proxy: fc.unwrap_or_else(|| create_generic_embedder_proxy()),
     }
@@ -147,6 +147,7 @@ fn new_fetch_context(
         ignore_certificate_errors: false,
         preloaded_resources: Default::default(),
         in_flight_keep_alive_records: Default::default(),
+        name_resolver: None,
     }
 }
 impl FetchTaskTarget for FetchResponseCollector {
